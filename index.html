@@ -35,7 +35,7 @@
                     <span class="text-[10px] text-slate-400">Open Camera</span>
                 </label>
 
-                <!-- Photo Library Picker (No capture attribute so iOS opens album picker) -->
+                <!-- Photo Library Picker -->
                 <label class="flex flex-col items-center justify-center border-2 border-dashed border-slate-200 rounded-xl p-4 text-center hover:border-blue-400 transition cursor-pointer bg-slate-50">
                     <input type="file" accept="image/*" onchange="handleReceiptUpload(event)" class="hidden">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8 text-indigo-500 mb-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -49,6 +49,14 @@
             <div id="loadingStatus" class="hidden text-center text-sm text-blue-600 font-medium animate-pulse pt-2">
                 Scanning receipt locally... Please wait.
             </div>
+
+            <!-- Collapsible Raw OCR Drawer -->
+            <details class="text-xs text-slate-500 pt-2">
+                <summary class="cursor-pointer font-medium hover:text-blue-600 transition">View / Edit Raw Scanned Text</summary>
+                <div class="mt-2 space-y-2">
+                    <textarea id="rawOcrText" oninput="parseReceiptText(this.value)" rows="5" placeholder="Raw scanned text will appear here. Edit directly to fix misread items in real time." class="w-full border border-slate-200 rounded-xl p-2.5 text-xs font-mono focus:outline-none focus:ring-2 focus:ring-blue-500 bg-slate-50"></textarea>
+                </div>
+            </details>
         </section>
 
         <!-- Step 2: Manage People -->
@@ -112,6 +120,13 @@
     <script>
         let people = [];
         let items = [];
+
+        // Words to filter out summary fields and receipt totals
+        const EXCLUDED_KEYWORDS = [
+            'subtotal', 'sub total', 'tax', 'tip', 'gratuity', 'total', 
+            'balance due', 'amount due', 'cash', 'change', 'visa', 'mastercard', 
+            'amex', 'card', 'approved', 'thank you', 'receipt', 'order'
+        ];
 
         // Add Person
         function addPerson() {
@@ -238,6 +253,7 @@
                 const ret = await worker.recognize(file);
                 await worker.terminate();
 
+                document.getElementById('rawOcrText').value = ret.data.text;
                 parseReceiptText(ret.data.text);
             } catch (err) {
                 console.error(err);
@@ -248,26 +264,65 @@
             }
         }
 
-        // Simple Heuristic Text Parser for Receipts
+        // Clean price string of common OCR mistakes (e.g. S4.O5 -> 54.05)
+        function normalizePriceString(rawPrice) {
+            return rawPrice
+                .replace(/[OSo]/g, '0')
+                .replace(/[sS]/g, '5')
+                .replace(/[I|l!]/g, '1')
+                .replace(/[B]/g, '8');
+        }
+
+        // Enhanced Heuristic Text Parser
         function parseReceiptText(text) {
+            const existingAssignments = {};
+            items.forEach(i => {
+                if (i.name) existingAssignments[i.name.toLowerCase()] = i.assignedTo;
+            });
+
             items = []; 
             const lines = text.split('\n');
-            const priceRegex = /(\d+\.\d{2})/g;
+            const decimalPriceRegex = /(\d+[.,]\d{2})/g;
+            const wholeNumberPriceRegex = /\b(\d{3,4})\b/g;
 
             lines.forEach(line => {
-                const matches = line.match(priceRegex);
+                const lowerLine = line.toLowerCase().trim();
+                
+                // Skip lines matching excluded summary keywords
+                if (EXCLUDED_KEYWORDS.some(keyword => lowerLine.includes(keyword))) {
+                    return;
+                }
+
+                let matches = line.match(decimalPriceRegex);
+                let priceVal = 0;
+
                 if (matches && matches.length > 0) {
-                    const price = parseFloat(matches[matches.length - 1]);
-                    let name = line.replace(priceRegex, '').trim();
-                    name = name.replace(/[^a-zA-Z0-9\s]/g, '').trim();
+                    let cleanPrice = normalizePriceString(matches[matches.length - 1]).replace(',', '.');
+                    priceVal = parseFloat(cleanPrice);
+                } else {
+                    // Fallback: look for 3-4 digit whole numbers without decimals (e.g., 1095 -> 10.95)
+                    let wholeMatches = line.match(wholeNumberPriceRegex);
+                    if (wholeMatches && wholeMatches.length > 0) {
+                        let rawNum = wholeMatches[wholeMatches.length - 1];
+                        priceVal = parseFloat(rawNum) / 100;
+                    }
+                }
+
+                if (priceVal > 0 && priceVal < 500) {
+                    let name = line
+                        .replace(decimalPriceRegex, '')
+                        .replace(wholeNumberPriceRegex, '')
+                        .replace(/[$@#%&*()[\]:;]/g, '')
+                        .trim();
                     
-                    if (name.length > 1 && price < 500) {
-                        items.push({ id: Date.now() + Math.random(), name, price, assignedTo: [] });
+                    if (name.length > 1) {
+                        const assignedTo = existingAssignments[name.toLowerCase()] || [];
+                        items.push({ id: Date.now() + Math.random(), name, price: priceVal, assignedTo });
                     }
                 }
             });
 
-            if (items.length === 0) {
+            if (items.length === 0 && text.trim().length > 0) {
                 items.push({ id: Date.now(), name: "Scanned Receipt Item", price: 0.00, assignedTo: [] });
             }
 
